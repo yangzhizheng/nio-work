@@ -13,6 +13,37 @@ linux 下面的app多个进程线程抢占cpu内存等资源，造成一些重�
 
 # 4.cgroups相关知识
 
+## cgroups的原理和概念
+1.可以实现对一个进程或者多个进程的资源占用（比如内存资源，cpu资源）的精细化控制。
+
+2.cgroups为每种可控制的资源定义一个子系统,称为cgroups子系统，比如cpuset子系统，memory子系统等。
+
+3.内核中的相关控制模块把该子系统作为配置文件，实现某个进程或者某组进程对于某个资源的精细化控制。如cpu资源的控制是通过进程调度模块根据cpu子系统的配置完成的。
+
+
+## cgroups层级结构
+1.内核定义cgroup结构体用来表示一个control group 对一个或者多个cgroups子系统的资源限制，多个cgroup结构体组成的一种树形结构，称为一个cgroups的层级结构。
+
+2.一个cgroup层级结构可以attach多个cgroups子系统，并且对这些子系统进行资源限制，一个子系统只能attach到一个cpu的层级结构中。
+
+3.cgroups层级结构中的每个节点（cgroup结构体）可以设置对于资源的不同限制权重，比如cgrp1组中的进程限制使用20%的cpu时间，cgrp2组中的进程限制使用80%的cpu时间。
+
+3.创建了cgroups层级结构中的节点（cgroup结构体）之后，可以把某个进程加入到cgroup结构体的控制任务列表中，cgroup结构体的控制任务列表中的所有进程都会受到当前节点的资源限制。由于
+cgroup层级结构attach的子系统不同，一个进程可以加入到不同cgroup层级结构的节点的控制列表中。是一种多对多的关系。
+
+## 进程与cgroups之间的关系
+1.每一个进程的描述中的指针指向一个辅助的数据结构css_set,一个进程只能属于一个css_set，一个css_set包含多个进程，css_set可以对指向它的进程进行资源限制。
+
+2.css_set通过上层的辅助数据结构可以实现与cgroups节点进行多对多的关联，但是同一个css_set不能关联到同一个cgroups层级结构的下不同节点，因为cgroups不允许对同一种资源有多个限制配置。
+
+3.一个css_set关联到不同cgroups层级结构时表明该css_set下的进程列表需要多多个资源进行限制，一个cgroups层级结构可以关联多个css_set表明不同css_set下面进程列表的进程对于资源的限制相同。
+
+## cgroups文件系统
+
+
+
+
+
 
 
 [Linux资源管理之cgroups简介](https://tech.meituan.com/2015/03/31/cgroups.html)
