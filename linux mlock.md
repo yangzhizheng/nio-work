@@ -2,6 +2,8 @@
 
 * 锁定物理内存，mlock家族成员有mlock,munlock,mlockall,munlockall.
 
+* 利用这些系统调用用户进程可以对自己需要的内存lock起来，直到调用unlock之前这段内存都会锁定在物理内存中，不会被回收。对于应用程序可以将对程序性能影响较大的数据lock起起来，避免非预期的页面回收引起性能波动。
+
 * 系统调用mlock成员允许程序锁住物理内存的部分或者全部地址，这样将阻止程序将这个内存页调度到交换空间（swap space),即使程序有一段时间没有访问该空间。
 
 * 对于实时性要求较高的程序希望锁住物理内存，内存页面调入或者调出的时间延迟可能过长或者不可预知。对于安全性要求较高的程序，内存页面调出也可能存在风险，攻击者可能恢复该页面内容。
@@ -11,6 +13,21 @@
 * 解除内存可以使用munlock,锁定全部内存使用mlockall,这个函数接受一个参数，MCL_CURRENT表示只锁定当前的内存，以后分配的内存不锁定，MCL_FUTURE表示以后分配的内存也需要锁定。
 
 * 锁定大量的内存是危险的，剩余的进程只能抢占剩下的内存空间，并且会加快内存页面的换入换出，当linux系统将整体缺少必要内存空间的时候会杀死进程。只有超级用户权限的进程才能使用mlock和mlockall对内存资源进行锁定。munlock会将进程锁定的所有内存空间解锁，包括mlock和mlockall锁定的空间。
+
+## memory lock实现原理
+* 用户进程的地址空间由一组vma结构来管理，每个vma代表一个已经映射，连续，属性相同的内存空间。memory lock执行的操作是给相应的vma 配置一个VM_LOCKED标记，这个标记会影响到内核的内存回收。
+
+* memory lock 操作指定的内存可能与vma不重合，这个时候会导致vma的合并或者分割。要满足同一个vma的内存属性一致，lock也属于属性。
+
+* 给用户空间使用的内存（用户空间分配的匿名内存和page cache),会通过LRU进行管理，内核线程会扫描LRU并且回收页面。当page reclaim流程扫描到一个“最近最少使用”的page的时候，会试图回收该内存。回收之前会通过反向映射找到包含了它的vma，从而找到映射了它的page table，从而将映射取消掉。如果映射了这个page的某个vma带有VM_LOCKED标志，说明这个page被某个进程lock(尽管不是所有映射它的进程都lock),这时就应该放弃回收，直到所有映射了这个page的vma都unlock 才释放该page.
+
+* 给相应的vma添加VM_LOCKED标记以及用page reclaim扫面反向映射检查该标记就是memory lock的核心处理逻辑。保证了被lock的page不会回收。内核在LRU中新增了一个unevictable_list,被lock 的页面将放在这个list中，并且不再被 page reclaim扫描，同时给该page配置一个PG_mlocked标识位，并且放入unevictable_list,这里并不一定保证成功。
+
+* memory unlock 是memory lock的逆过程，相应的vma的VM_LOCKED标记会被去掉，同是还要反向映射去检查该page是否已经不再被其他的vma所lock,如果是的则进行下一步，将该page上的PG_mlocked标记取消，并且从unevictable_list中移除。若否则表明该page没有被unlock完全，此时不需要操作。memory unlocked并不立即将该解锁的page回收，而是交给自然的回收过程。
+
+* 
+
+
 
 ## 写时复制（copy on wirte)
 * 写时复制意味着仅当进程在写入内存的任意位置时候，linux才会为进程创建该区内存的副本。
