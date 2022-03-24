@@ -23,7 +23,7 @@
 
 * 给相应的vma添加VM_LOCKED标记以及用page reclaim扫描反向映射检查该标记就是memory lock的核心处理逻辑。保证了被lock的page不会回收。内核在LRU中新增了一个unevictable_list,被lock 的页面将放在这个list中，并且不再被 page reclaim扫描，同时给该page配置一个PG_mlocked标识位，并且放入unevictable_list,这里并不一定保证成功。
 
-* memory unlock 是memory lock的逆过程，相应的vma的VM_LOCKED标记会被去掉，同时还要反向映射去检查该page是否已经不再被其他的vma所lock,如果是的则进行下一步，将该page上的PG_mlocked标记取消，并且从unevictable_list中移除。若否则表明该page没有被unlock完全，此时不需要操作。memory unlocked并不立即将该解锁的page回收，而是交给自然的回收过程。
+* memory unlock 是memory lock的逆过程，相应的vma的VM_LOCKED标记会被去掉，同时还要反向映射去检查该page是否已经不再被其他的vma所lock,如果是的则进行下一步，将该page上的PG_mlocked标记取消，并且从unevictable_list中移除。若否则表明该page没有被unlock完全，此时不需要操作。memory unlocked并不立即将该解锁的page回收，而是进行自然的回收过程。
 
 * memory lock只要保证vma 使用了VM_LOCKED标记，即使内存页面没有分配成功，或者该page没有放入unevictable_list,都不会影响被lock的事实，因为page reclaim会反向映射找到vma中的VM_LOCKED标志。memory unlock一定确保成功，因为如果unlock后page 没有从unevictable_list中移除，那么该page就不会被回收。
 
