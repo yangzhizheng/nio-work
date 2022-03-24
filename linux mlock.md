@@ -21,7 +21,7 @@
 
 * 给用户空间使用的内存（用户空间分配的匿名内存和page cache),会通过LRU进行管理，内核线程会扫描LRU并且回收页面。当page reclaim流程扫描到一个“最近最少使用”的page的时候，会试图回收该内存。回收之前会通过反向映射找到包含了它的vma，从而找到映射了它的page table，从而将映射取消掉。如果映射了这个page的某个vma带有VM_LOCKED标志，说明这个page被某个进程lock(尽管不是所有映射它的进程都lock),这时就应该放弃回收，直到所有映射了这个page的vma都unlock 才释放该page.
 
-* 给相应的vma添加VM_LOCKED标记以及用page reclaim扫面反向映射检查该标记就是memory lock的核心处理逻辑。保证了被lock的page不会回收。内核在LRU中新增了一个unevictable_list,被lock 的页面将放在这个list中，并且不再被 page reclaim扫描，同时给该page配置一个PG_mlocked标识位，并且放入unevictable_list,这里并不一定保证成功。
+* 给相应的vma添加VM_LOCKED标记以及用page reclaim扫描反向映射检查该标记就是memory lock的核心处理逻辑。保证了被lock的page不会回收。内核在LRU中新增了一个unevictable_list,被lock 的页面将放在这个list中，并且不再被 page reclaim扫描，同时给该page配置一个PG_mlocked标识位，并且放入unevictable_list,这里并不一定保证成功。
 
 * memory unlock 是memory lock的逆过程，相应的vma的VM_LOCKED标记会被去掉，同是还要反向映射去检查该page是否已经不再被其他的vma所lock,如果是的则进行下一步，将该page上的PG_mlocked标记取消，并且从unevictable_list中移除。若否则表明该page没有被unlock完全，此时不需要操作。memory unlocked并不立即将该解锁的page回收，而是交给自然的回收过程。
 
