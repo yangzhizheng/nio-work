@@ -27,4 +27,14 @@
     
 * 在进行优化分析之前，要对模型进行建模和流程分析，找出系统的瓶颈和问题所在，liunx的tracing技术可以帮助我们进行目标业务流的建模以及找出模型的关键指标。
 
-# linux tracing技术的发展
+# linux tracing技术
+
+## kprobe/kretprobe
+* 提供在内核态动态添加探针的方式，使用前确定内核config打开，CONFIG_KPROBE_EVENT=y
+* 使用场景：查看函数的调用频次和执行时间。查看函数调用的参数和返回值。
+
+### 基本原理：替换目标指令为brk（arm架构）,以此陷入到kprobe机制中。
+* 用户通过int register_kprobe(struct kprobe \*p)注册一个探测点，在注册的过程中，kprobe机制会通过用户传入的symbol名称找到其对应的指令地址，并且将指令地址和具体的指令备份到kprobe结构的addr和opcode属性中，然后将kprobe插入到kprobe_table中。最后将原始指令的入口点替换为BRK指令，并且将BRK指令的立即数设置为0x4或者0x6。用来表示本次trap由kprobe机制触发。
+* 
+
+
