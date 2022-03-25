@@ -35,6 +35,16 @@
 
 ### 基本原理：替换目标指令为brk（arm架构）,以此陷入到kprobe机制中。
 * 用户通过int register_kprobe(struct kprobe \*p)注册一个探测点，在注册的过程中，kprobe机制会通过用户传入的symbol名称找到其对应的指令地址，并且将指令地址和具体的指令备份到kprobe结构的addr和opcode属性中，然后将kprobe插入到kprobe_table中。最后将原始指令的入口点替换为BRK指令，并且将BRK指令的立即数设置为0x4或者0x6。用来表示本次trap由kprobe机制触发。
-* 
+* 陷入到kprobe机制过后，kprobe的处理机制采用（register_kernel_break_hook)的方式注册为钩子函数。会去遍历kprobe_table，匹配与本次发生brk相同地址的kprobe,先调用kprobe中的pre_handler,在执行原来的指令，再调用post_handler(如果用户注册）。
+### 使用方法
+* 使用加载模块使用方法
+* 通过ftrace的方法
+### 使用限制
+* 一般情况下可以探测内核中的任何函数，包括中断处理函数，在kernel/kprobes.c中用于实现kprobes自身的函数是不允许被探测的。
+* 如果探测点为内联函数，可能无法保证对该函数所有的实例都注册探测点，由于gcc优化可能会将某些函数优化为内联函数，可能无法达到用户预期的探测效果。
+* 一个探测点的回调函数可能会修改被探测函数运行的上下文，例如通过修改内核的数据结构或者保存与struct pt_regs结构体中的触发探测之前的寄存器信息。因此kprobes可以被用来安装bug修复代码或者注入故障测试代码
+* kprobes回调函数的运行期间是关闭内核抢占的，在回调函数中不要调用会放弃cpu的函数。（如信号量，mutex锁）
+
+## uprobe/uretprobe
 
 
