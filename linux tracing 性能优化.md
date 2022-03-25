@@ -48,3 +48,6 @@
 ## uprobe/uretprobe
 * kprobe是用于内核插入探针的方式，uprobe是用户态插入探针。两种方式的实现和原理基本相同，唯一的区别是要给出执行文件的路径（如果不在环境变量中），
 
+## Tracepoints
+* tracepoints是linux内核静态插桩的方法，它提供一套API和框架。
+
