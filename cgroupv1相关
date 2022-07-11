@@ -1,0 +1,844 @@
+cgroups v1内核实现
+暂时无法在文档外展示此内容
+cgroup内核源码详解
+linux内核CFS调度器
+1.cgroup中的数据结构
+
+
+1.task_struct是管理进程的数据结构
+struct task_struct {
+#ifdef COFIG_CGROUPS
+  struct css_set *cgroups;
+  struct list_head cg_list; //用于将连接到同一个css_set的进程组织成一个链表
+#endif
+};
+
+2.css_set  是用于连接多个进程，并且把进程连接到cgroups结构体中
+struct css_set {
+  atomic_t refcount; //一个css_set可以被多个进程引用，该css_set的引用数
+  struct hlist_node hlist; //把css_set组织成一个hash表，内核快速查找特定的css_set
+  struct list_head tasks;//与task_struct中的cg_list相连接，指向连接到此css_set的进程连成的链表
+  struct list_head cg_links;//指向由cg_cgroup_link连成的链表
+  struct cgroup_subsys_state *subsys[CGROUP_SUBSYS_COUNT];//一个cgroup_subsys_state是进程与一个特定子系统相关信息，存储一组指向cgroup_subsys_state的指针，进程可以获得相应cgroups的控制信息。
+  struct rcu_head rcu_head;
+};
+
+3.cgroup_subsys_state
+struct cgroup_subsys_state {
+  struct cgroup *cgroup;//指向进程属于的cgroup
+  atomic_t refcnt;
+  unsigned long flags;
+  struct css_id *id;
+};
+
+进程受到子系统的控制，实际上是通过加入到特定的cgroup实现的，因为cgroup在特定的层级结构上，而资源子系统是attach到层级结构上。通过以上三个结构，进程可以和cgroup连接起来。task_struct --> css_set --> cgroup_subsys_state --> cgroup
+
+暂时无法在文档外展示此内容
+4.cgroup结构体
+struct cgroup {
+  unsigned long flags;
+  atomic_t count;
+  struct list_head sibling;//兄弟节点
+  struct list_head children;//孩子节点
+  struct cgroup *parent;//父亲节点
+  struct dentry *dentry;
+  struct cgroup_subysy_state *subsys[CGROUP_SUBSYS_COUNT];//这组指针指向了此cgroup跟各个子系统相关的信息，跟css_set一样
+  struct cgroupfs_root *root;//指向cgroup所在的层级对应的结构体
+  struct cgroup *top_cgroup;//指向了所在层级的根cgroup,创建层级是自动创建的cgroup
+  struct list_head css_sets;//指向一个由struct cg_cgroup_link连成的链表，跟css_set的cg_links相同。
+  struct list_head release_list;
+  struct list_head pidlists;
+  struct mutex pidlist_mutex;
+  struct rcu_head rcu_head;
+  struct list_head event_list;
+  spinlock_t event_list_lock;
+};
+
+暂时无法在文档外展示此内容
+5.cg_cgroup_link
+struct cg_cgroup_link {
+  struct list_head cgrp_link_list;//连入到cgroup->css_sets指向的链表
+  struct cgroup *cgrp;//指向此cg_cgroup_link相关的cgroup
+  struct list_head cg_link_list;//连入到css_set->cg_links指向的链表，
+  struct css_set *cg;//指向此cg_cgroup_link相关的css_set
+};
+
+暂时无法在文档外展示此内容
+1.cg_cgroup_link结构为什么要这样设计？
+因为cgroup与css_set之间存在一种多对多的关系，必须添加一个中间结构来把两者联系起来。这种类似于数据库的多对多模式。cgrp和cg作为主键，cgrp_link_list和cg_link_list分别连入到cgroups和css_set中的相应的链表，使得能从css_set或者cgroup都能进行遍历查询。
+2.cgroup和css_set为什么是多对多关系？
+同一个css_set中的一组进程，可能需要对不同资源进行限制。一个css_set存储一组进程和各个子系统相关的信息，但是这些信息可能不是从一个cgroups层级结构获得的。一个css_set存储的cgroup_subsysy_state可以对应多个cgroup。比如某一个cgroups的层级结构只attach了几个资源子系统，而一组进程可能需要对其他资源进行限制，这时候，一个css_set可能关联不同cgroups层级结构中的cgroup。
+一个cgroup存储了一组cgroup_subsysy_state ,这一组cgroup_subsys_state是从所在的层级attch的子系统中获得的。一个cgroup中可以有多个进程，这些进程的css_set不一定都相同，因为有些进程可能还加入了其他cgroup。但是在一个cgroup中的多个进程和该cgroup中的cgroup_subsys_state都受到该cgroup的管理（cgroups中的进程控制是以cgroup为单位的),所以一个cgroup对应多个css_set。
+3.为什么需要这样一个结构
+从一个task（进程）到cgroup是很容易定位的，根据前面的说明，但是从cgroup获取此cgroup的所有task必须通过cg_cgroup_link这个结构来获取。每个进程都会指向一个css_set,而且与这个css_set相关联的所有进程都会连入到css_set->tasks链表中，cgroup通过一个中间结构cg_cgroup_link来寻找所有和它相关联的css_set,从而可以得到与cgroup相关联的所有进程。
+暂时无法在文档外展示此内容
+6.层级对应的结构体cgroupfs_root
+struct cgroupfs_root {
+  struct super_block *sb;//指向该层级关联的文件系统超级快
+  unsigned long subsysy_bits;//要附加到该层级的资源子系统
+  int hierarchy_id;该层级唯一id
+  unsigned long actual_subsys_bits;//实际附加到层级的子系统，在子系统附加到层级时使用
+  struct list_head subsys_list;//附加到该层级的资源子系统链表
+  struct cgroup top_cgroup;//指向该层级的根cgroup
+  int number_of_cgroups;//该层级cgroup的个数
+  struct list_head root_list;//将系统所有的层级连接成一个链表
+  unsigned long flags;
+  char release_agent_path[PATH_MAX];
+  char name[MAX_CGRUP_ROOT_NAMELEN];
+};
+
+7.资源子系统cgroup_subsys
+定义了一组操作，让各个子系统根据需要去实现。相当于c++中的抽象基类，然后各个特定的子系统对应的cgroup_subsys则是实现了相应的操作的子类。类似的思想还用在cgroup_subsys_state,cgroup_subsys_state未定义控制信息，而是定义了各个子系统都需要的共同信息，比如该cgroup_subsys_state从属的cgroup。然后各个子系统根据需要去定义自己的进程控制信息结构体，最后在各个的结构体中将cgroup_subsys_state包含进去，这样通过linux内核的container_of等宏可以通过cgroup_subsys_state来获取相应的结构体。
+2.cgroup文件系统
+1.cgroups用户空间管理
+用户空间管理是通过cgroups文件系统实现的。
+比如要创建一个层级：
+mount -t cgroup -o cpu,cpuset,memory cpu_and_mem /cgroup/cpu_and_mem
+创建一个层级名为cpu_and_mem,这个层级上附加了cpu,cpuset,memory子系统，并且这个层级挂载到/cgroup/cpu_and_mem
+创建一个cgroup：cd /cgroup/cpu_and_mem
+mkdir foo 在cpu_and_mem层级结构下创建一个名为foo的cgroup
+cd foo, ls 会发现一些文件，这是cgroups的相关控制子系统的控制文件，可以读取这些控制文件，这些控制文件中存储的信息
+就是cgroup中的相关控制信息。也可以写控制文件来更改这些控制信息。
+这些文件中，有一个叫做tasks的文件，里面包含了所有属于这个cgroup的进程的进程号。
+在刚才创建的foo下，cat tasks应该是空的，因为此时这个cgroup里面还没有进程。
+cd /cgroup/cpu_and_mem 再 cat tasks 可以看到系统中的所有进程的进程号，这是因为每创建一个层级的时候，系统中所有进程都会自动被加入到该层级的根cgroup里面。tasks文件不仅可以读，还可以写，将一个进程的进程号写入到某个cgroup目录下的tasks里面，就将这个进程加入到了相应的cgroup.
+
+2.cgroup文件系统的实现
+1.VFS文件系统的原理
+VFS是一种虚拟文件系统转换，是一个内核软件层，用来处理与Unix标准文件系统的所有系统调用，VFS对用户提供统一的读写等文件操作调用接口，当用户调用读写等函数时，内核调用特定的文件系统实现。文件在内核中是一个file数据结构来表示的，file数据结构包含f_op字段，该字段包含一组指向特定文件系统实现的函数指针。当用户执行read()操作时，内核调用sys_read(),然后sys_read()查找到指向该文件属于的文件系统的读函数指针，并且调用它，file-->f_op-->read()。
+VFS是面向对象的，在这里对象是一个软件结构，既定义数据也定义数据之上的操作，为了效率，linux并没有采用c++之类的面向对象的语言，采用了c的结构体，然后在结构体里面定义了一系列函数指针，这些函数指针对应于对象的方法。
+2.VFS文件系统定义的对象模型
+- 超级块对象（superblock object):存放已安装文件系统的相关信息
+- 索引节点对象（inode object):存放关于具体文件的一般信息
+- 文件对象（file object)：存放打开文件与进程之间的交互信息
+- 目录项对象（dentry object):存放目录项与对应文件系统进行链接有关信息。
+基于VFS实现的文件系统，必须实现定义这些对象，并且实现这些对象中定义的函数指针。
+cgroup文件系统也需要实现这些对象以及定义的函数指针。
+1.cgroup文件系统的定义
+static struct file_system_type cgroup_fs_type = {
+  .name = "cgroup",
+  .get_sb = cgroup_get_sb,//定义了函数指针，获得超级块
+  .kill_sb = cgroup_kill_sb;//函数指针，释放超级块
+};
+
+获得和释放超级快会在使用mount系统调用挂载cgroup文件系统时使用。
+2.cgroup超级块的定义。
+static const struct super_operations cgroup_ops = {
+  .statfs = simple_statfs,
+  .drop_inode = generic_delete_inode,
+  .show_options = cgroup_show_options,
+  .remount_fs = cgroup_remount,
+};
+
+3.cgroup索引块定义
+static const struct inode_operations cgroup_dir_inode_operations = {
+  .lookup = simple_lookup,
+  .mkdir = cgroup_mkdir,//使用mkdir创建cgroup时，
+  .rmdir = cgroup_rmdir,
+  .rename = cgroup_rename,
+};
+
+在cgroup文件系统中，使用mkdir或者rmdir，创建或者删除cgroup的时候，会调用相应的函数指针指向的函数。使用mkdir创建cgroup的时候，会调用cgroup_mkdir,然后在cgroup_mkdir中调用具体实现的cgroup_create函数
+4.cgroup文件操作定义
+static const struct file_operations cgroup_file_operations = {
+  .read = cgroup_file_read,
+  .write = cgroup_file_write,
+  .llseek = generic_file_llseek,
+  .open = cgroup_file_open,
+  .release = cgroup_file_release,
+};
+
+在cgroup文件系统中，对目录下的控制文件进行操作时，会调用该结构体中指针指向的函数。对文件进行读操作时，会调用cgroup_file_read,在cgroup_file_read中。，会根据需要调用该文件对应的cftype结构定义的对应读函数。。
+5.cftype是cgroups控制文件，cftype来管理控制文件
+cftype中除了定义文件的名字和相关权限标记外，主要定义了对文件进行操作的函数指针。不同的文件可以有不同的操作，对文件进行操作的时候，相关函数指针指向的函数会被调用。
+综上分析，cgroups通过实现cgroup文件系统来为用户提供管理cgroup的工具，cgroup文件系统是基于linux VFS实现的。cgroups为控制文件定义了相应的数据结构cftype, 对其操作由cgroup文件系统定义的通过操作捕获，再调用cftype定义的具体实现。
+
+3.子系统的实现
+1.cpuset子系统
+cpuset子系统为cgroup中的任务分配独立的cpu（多核系统）和内存节点。定义一个cpuset的数据结构来管理cgroup中的任务能够使用的cpu和内存节点
+struct cpuset {
+  struct cgroup_subsys_state css; //用于task或cgroup获取cpuset结构
+  
+  unsigned long flags;
+  cpumask_var_t cpus_allowed;//定义该cpuset包含的cpu
+  nodemask_t mems_allowed;//定义该cpuset包含的内存节点
+  
+  struct cpuset *parent;//维持cpuset的树状结构
+  
+  struct fmeter fmeter;
+  
+  int pn;//指定cpuset的调度域的分区号
+  
+  int relax_domain_level;//进行cpu负载均衡寻找空闲cpu策略
+  struct list_head stack_list; //遍历cpuset的层次结构
+};
+
+进程的task_struct结构体里面有一个cpumask_t  cpus_allowed成员，用以存储进程的cpus_allowed信息，一个nodemask_t  mems_allowed成员，存储进程的mems_allowed信息。
+cpuset子系统的实现是通过在内核代码中加入一些hook代码。在内核初始化代码（start_kernel函数）中插入了对cpuset.init 调用的代码，通过这个函数用于cpuset的初始化。
+int __init cpuset_init(void)
+{
+   int err = 0;
+   
+   if(!alloc_cpumask_var(&top_cpuset.cpus_allowed,GFP_KERNEL))
+      BUG();
+     
+   cpumask_setall(top_cpuset.cpus_allowed);//将top_cpuset能使用的cpu设置成所有节点
+   nodes_setall(top_cpuset.mems_allowed);//将top_cpuset能使用的mem设置成所有节点
+   
+   fmeter_init(&top_cpuset.fmeter);//初始化fmeter
+   set_bit(CS_SCHED_LOAD_BALANCE, &top_cpuset.flags);//设置top_cpuset的load balance标志
+   top_cpuset.relax_domain_level = -1;
+   
+   err = register_filesystem(&cpuset_fs_type);//注册cpuset文件系统
+   if(err < 0)
+      return err;
+    
+   if(!alloc_cpumask_var(&cpus_attach,GFP_KERNEL))
+     BUG();
+     
+   number_of_cpusets = 1;
+   return 0;
+ }
+
+注册cpuset文件系统是为了兼容性，在cgroups之前就有cpuset,不过在具体实现的时候，对cpuset文件系统的操作都被重定向了cgroup文件系统。
+
+cpuset子系统在do_basic_setup函数（这个函数在kernel_init中被调用）中插入对cpuset_init_smp的调用代码，用于smp相关的初始化。
+void __init cpuset_init_smp(void)
+{
+  cpumask_copy(top_cpuset.cpus_allowed,cpu_active_mask);
+  top_cpuset.mems_allowe = node_states[N_HIGH_MEMORY];
+  
+  hotcpu_notifier(cpuset_track_online_cpus, 0);
+  hotplug_memory_notifier(cpuset_track_online_nodes, 10);
+  
+  cpuset_wq = create_singlethread_workspace("cpuset");
+  BUG_ON(!cpuset_wq);
+}
+
+首先将top_cpuset的cpu和memory节点设置为所有online节点，之前初始化是不知道有哪些online节点所以只是简单的设成所有，在smp初始化后可以将其设成所有online节点。加入两个hook函数，cpuset_track_online_cpus和cpuset_track_online_nodes这两个函数将在cpu和memeory热插拔时被调用。
+cpuset_track_online_cpus函数中调用scan_for_empty_cpusets函数扫描空的cpuset，并将其下的进程移到其非空的parent下，同时更新cpuset的cpus_allowed信息。cpuset_track_online_nodes的处理类似。
+1. 对cpu节点的控制
+cpuset是怎么对进程的调度起作用的，跟task_struct中cpu_allowed字段有关，这个cpu_allowed和进程所属的cpuset的cpus_allowed保持一致，其次，在进程被fork出来的时候，进程继承了父进程的cpuset和cpus_allowed字段，最后，进程被fork出来后，除非指定CLONE_STOPPED标记。都会被调用wake_up_new_task唤醒，在 wake_up_new_task中有
+cpu = select_task_rq(rq,p,SD_BALANCE_FORK,0);
+set_task_cpu(p,cpu);
+
+为新fork出来的进程选择运行的cpu，而select_task_rq会调用进程所属的调度器的函数，对于普通进程，其调度器是CFS,CFS对应的函数是select_task_rq_fair。在select_task_rq_fair返回选到的cpu后，select_task_rq会对结果和cpu_allowed比较
+if (unlikely(!cpumask_test_cpu(cpu,&p->cpus_allowed) ||
+        !cpu_online(cpu)))
+     cpu = select_fallback_rq(task_cpu(p),p);
+
+这就保证了新fork出来的进程只能在cpu_allowed中的cpu上运行。
+对于被wake up 的进程来说，在被调度之前，也会调用select_task_rq选择可运行的cpu。
+这就保证了进程任何时候都只会在cpu_allowed中的cpu上运行。
+
+如何保证task_struct中的cpus_allowed和进程所属的cpuset中的cpus_allowed一致。在cpu热插拔时，scan_for_empty_cpusets会更新task_struct中的cpu_allowed信息，其次对cpuset下的控制文件写入操作时也会更新task_struct中的cpu_allowed信息，最后当一个进程被attach到其他cpuset时，同样会更新task_strcut中的cpus_allowed信息。
+在cpuset之前，linux内核就提供了指定进程可以运行的cpu的方法，通过调用sched_setaffinity可以指定进程可以运行的cpu，cpuset对其进行了扩展，保证此调用设定的cpu仍然在cpu_allowed的范围内，在sched_setaffinity中，插入了这样两行代码
+cpuset_cpus_allowed(p,cpus_allowed);
+cpumask_and(new_mask,in_mask,cpus_allowed);
+
+cpuset_cpus_allowed返回进程对应的cpuset中的 cpus_allowed, cpumask_and将cpus_allowed和调用sched_setaffinity时的参数in_mask相与得出进程新的cpu_allowed.
+通过以上代码的嵌入，linux内核实现了对进程可调度的cpu的控制。
+2.对memory节点的控制
+linux中内核分配物理页框的函数有6个，
+alloc_pages,  alloc_page,   __get_free_pages, __get_free_page,  get_zeroed_page,__get_dma_pages
+这些函数最终都通过alloc_pages实现，alloc_pages又通过__alloc_pages_nodemask实现，在__alloc_pages_nodemask中，调用get_page_from_freelist从 zone list中分配一个page,在get_page_from_freelist中调用cpuset_zone_allowed_softwall判断当前节点是否属于mems_allowed通过附加一个判断，保证进程从mems_allowed中的节点分配内存。
+
+linux在cpuset出现之前，也提供mbind,set_mempolicy来限定进程可用的内存节点，cpuset子系统对其做了扩展，扩展的方法和扩展sched_setaffinity类似，通过导出cpuset_mems_allowed，返回进程所属的cpuset允许的内存节点，对mbind,set_mempolicy的参数进行过滤。
+3.cpuset中的两个控制文件
+{
+   .name = "cpus",
+   .read = cpuset_common_file_read,
+   .write_string = cpuset_write_resmask,
+   .max_write_len = (100U + 6 * NR_CPUS),
+   .private = FILE_CPULIST,
+},
+
+{
+   .name = "mems",
+   .read = cpuset_common_file_read,
+   .write_string = cpuset_write_resmask,
+   .max_write_len = (100U + 6 * MAX_NUMNODES),
+   .private = FILE_MEMLIST,
+},
+
+通过cpus文件，可以指定进程可以使用的cpu节点，通过mems文件，可以指定进程可以使用的memory节点。这两个文件都是通过cpuset_common_file_read和cpuset_write_resmask实现的，通过private属性区分。在cpuset_common_file_read中读出可用的cpu和memory节点，在cpuset_write_resmask中根据文件类型分别调用update_cpumask和update_nodemask更新cpu或memory节点信息
+
+2.cpu子系统的实现
+1.cpu.shares字段
+cpu子系统用于控制cgroup中所有进程可以使用的cpu时间片，附加了cpu子系统的hierarchy下面建立的cgroup的目录下都有一个cpu.shares文件，对其写入整数值可以控制该cgroup获得的时间片。例如在两个cgroup中都将cpu.shares设定为1的任务将有相同的cpu时间，但在cgroup中将cpu.shares设定为2的任务可使用的cpu时间是在cgroup中将cpu.shares设定为1的任务可使用的cpu时间的两倍。
+2.CFS调度器
+cpu子系统是通过linux CFS调度器实现。CFS在真实的硬件上模拟了完全理想的多任务处理器，在完全理想的多任务处理器下，CFS调度器每次都选择过去运行最少的进程运行，每个进程都能同时获得cpu的执行时间，当系统中有两个进程时候，cpu的计算时间被分成两份，每个进程获得50%，然而在实际的硬件上，当一个进程占用cpu时，其他进程必须等待，CFS将惩罚当前进程，使其在下次调度时尽可能取代当前进程，最终实现所有进程的公平调度。
+最小运行时间：为了避免过度频繁的抢占发生，linux内核设置了每个task的最小运行时间，在这个时间内，这个进程的cpu资源是不可被抢占的，除非进程主动让出cpu或者执行了阻塞的系统调用，一般而言进程都可以执行完最少运行时间。
+时间片：CFS通过引入权重来保证高优先级的进程能够获得更多的cpu时间。进程间按照权重比例分配时间片，权重是一个和nice值有关的量。
+CFS调度器将所有的状态为RUNABLE的进程都插入红黑树，在每个调度点，CFS调度器都会选择红黑树的最左边的叶子节点作为下一个将获得cpu的进程，红黑树的键值是怎么计算的，红黑树的键值是进程的虚拟运行时间，一个进程的虚拟运行时间是进程运行的时间按整个红黑树中所有的进程数量normalized的结果。
+每次tick中断，CFS调度器都要更新进程的虚拟运行时间，然后调整当前进程在红黑树中的位置，调整完成后如果发现当前进程不再是最左边的叶子，就标记为need_resched,中断返回后就会调用scheduler()完成进程切换。
+进程的优先级和进程虚拟运行时间的关系，每次tick中断，CFS调度器都要更新进程的虚拟运行时间，这个时间是怎么计算的，CFS首先计算出进程的运行时间delta_exec，然后计算normalized后的delta_exec_weighted，最后再将delta_exec_weighed加到进程的虚拟运行时间上，跟进程优先级有关的就是delta_exec_weighted, delta_exec_weighted=delta_exec_weighted*NICE_0_LOAD/se->load,其中NICE_0_LOAD是个常量，se->load跟进程的nice值成反比，进程优先级越高（nice值越小）则se->load越大，则计算出的delta_exec_weighted越小。这样优先级越高的进程可以获得更多的cpu时间。
+3.cpu子系统如何通过CFS调度器实现
+1.cpu系统通过CFS调度器实现以cgroup为单位的cpu时间片分享
+CFS调度器不仅支持基于进程的调度，还支持基于进程组的组调度。CFS定义了一个task_group的数据结构来管理组调度。
+struct task_group {
+  struct cgroup_subsys_state css;
+  
+#ifdef CONFIG_FAIR_CGROUP_SCHED
+  struct sched_entity **se;//指针数组，存了一组指向该task_group在每个cpu调度实体（一个struct sched_entity)
+  struct cfs_rq **cfs_rq;//指针数组，存了一组指向该task_group在每个cpu上所拥有的一个可调度的进程队列
+  unsigned long shares;
+#endif
+
+#ifdef CONFIG_RT_GROUP_SCHED
+  struct sched_rt_entity **rt_se;
+  struct rt_rq **rt_rq;
+  
+  struct rt_bandwidth rt_bandwidth;
+#endif
+
+  struct rcu_head rcu;
+  struct list_head list;
+  struct task_group *parent;
+  struct list_head siblings;
+  struct list_head children;
+}
+
+task_group中内嵌了一个cgroup_subsys_state也就是说进程可以通过cgroup_subsys_state来获取它所在的task_group，同样的cgroup也可以通过cgroup_subsys_state来获取它所对应的task_group,因此进程和cgroup都存在了一组cgroup_subsys_state指针。
+
+有了task_group这个数据结构，CFS在调度的时候是怎么处理进程组的，从CFS对tick中断的处理开始，
+CFS对tick中断的处理在task_tick_fair中进行，在task_tick_fair中有
+for_each_sched_entity(se) {
+   cfs_rq = cfs_rq_of(se);
+   entity_tick(cfs_rq,se,queued);
+}
+
+在组调度的情况下，for_each_sched_entity是怎么定义的
+#define for_each_sched_entity(se) \
+  for (;se;se=se->parent)
+
+从当前进程的se开始，沿着task_group树从下到上对se调用entity_tick,更新各个se的虚拟运行时间。
+在非组调度的情况下,只会对当前se做处理
+#define for_each_sched_entity(se) \
+    for(;se;se=NULL)
+
+CFS处理完tick中断后，如果有必要就会进行调度，CFS调度通过pick_next_task_fair函数选择下一个运行的进程的，在pick_next_task_fair中有
+do {
+    se=pick_next_entity(cfs_rq);
+    set_next_entity(cfs_rq,se);
+    cfs_rq=group_cfs_rq(se);
+}while(cfs_rq);
+
+在循环中，首先从当前的队列中选一个se，这个跟非组调度一样（红黑树最左边的节点），再将se设置成下一个运行的se,再从该se获取该se对应的task_group拥有的cfs_rq(如果该se对应一个进程而非一个task_group，cfs_rq会变成NULL),继续这个过程直到cfs_rq为空，就是当se对应的是一个进程。
+
+简而言之，同一层的task_group跟进程被当成同样的调度实体来选择，当被选到的是task_group时，对task_group的孩子节点重复这个过程，直到选到一个运行的进程。因此当设置一个cgroup的shares值时，该cgroup当作一个整体和剩下的进程或其他cgroup分享cpu时间。
+引起CFS调度的除了tick中断外，还有是新的进程加入到可运行队列的情况，CFS处理这个情况的函数是enqueue_task_fair在enqueue_task_fair中有
+for_each_sched_entity(se) {
+   if(se->on_rq)
+      break;
+   cfs_rq = cfs_rq_of(se);
+   enqueue_entity(cfs_rq,se,flags);
+   flags = ENQUEUE_WAKEUP;
+}
+
+前面已经看到过for_each_sched_entity在组调度下的定义，这里是将当前se和se的直系祖先节点都加入到红黑树，而在非组调度情况下，只需要将当前se本身加入即可。造成这种差异的原因，在于pick_next_task_fair中选择se时，是从上往下的，如果一个se的祖先节点不在红黑树中，它永远不会被选中，而在非组调度的情况下，se之间没有父子关系，所有se都是平等独立，在pick_next_task_fair第一次选中的肯定是进程，不需要向下迭代。
+类似的处理还发生在将一个se出列（dequeue_task_fair）和put_prev_task_fair中。以上是cpu系统通过CFS调度器实现以cgroup为单位的cpu时间片分享。
+2.cpu子系统本身
+cpu子系统通过一个cgroup_subsys结构体来管理
+strcut cgroup_subsys cpu_cgroup_subsys= {
+   .name = "cpu",
+   .create = cpu_cgroup_create,
+   .destory = cpu_cgroup_destroy,
+   .can_attach = cpu_cgroup_can_attach,
+   .attach = cpu_cgroup_attach,
+   .populate = cpu_cgroup_populate,
+   .subsys_id = cpu_cgroup_subsys_id,
+   .early_init = 1,
+ };
+
+cpu_cgroup_subsys其实是对抽象的cgroup_subsys的实现，其中的函数指针指向了特定于cpu子系统的实现。
+cgroup的整体设计是当用户使用cgroup文件系统，创建cgroup的时候，会调用cgroup目录操作的mkdir指针指向的函数，该函数调用了cgroup_create,而cgroup_create会根据该cgroup关联的子系统，分别调用对应的子系统实现的create指针指向的函数。做了两次转换，一次从系统通用命令到cgroup文件系统，另一次从cgroup文件系统到特定的子系统的实现。
+
+cgroups中除了通用的控制文件外，每个子系统还有自己的控制文件，子系统也是通过cftype来管理这些控制文件。cpu系统中很重要的一个文件是cpu.shares文件，因为就是通过这个文件的数值来调节cgroup所占用的cpu时间，shares文件对应的cftype结构为
+#ifdef CONFIG_FAIR_CGOUP_SCHED
+  {
+     .name = "shares",
+     .read_u64 = cpu_shares_read_u64,
+     .write_u64 = cpu_shares_write_u64,
+  },
+#endif
+
+当对cgroup目录下的文件进程操作时，该结构体中定义的函数指针指向的函数会被调用，
+static u64 cpu_shares_read_u64(struct cgroup *cgrp,struct cftype *cft)
+{
+   struct task_cgroup *tg = cgroup_tg(cgrp);
+   return (u64) tg->shares;
+}
+
+简单的读取task_group中存储的shares就行
+static int cpu_shares_write_u64(struct cgroup *cgrp,struct cftype *cftype,
+                         u64 shareval)
+{
+   return sched_group_set_shares(cgroup_tg(cgrp),shareval);
+}
+
+
+设定cgroup对应的task_cgroup的shares值
+tg->shares = shares;
+for_each_possible_cpu(i) {
+   /*
+   *force a rebalance
+    */
+    cfs_rq_set_shares(tg->cfs_rq[i],0);
+    set_se_shares(tg->se[i],shares);
+}
+
+cfs_rq_set_shares强制做一次cpu SMP负载均衡，真正起作用的是set_se_shares中，它调用了__set_se_shares,在__set_se_shares中有
+se->load.weight = shares;
+se->load.inv_weight = 0;
+
+根据之前分析的CFS的调度原理可以知道，load_weight的值越大，虚拟运行时间越小，进程能用的cpu时间越多，shares值最终是通过调度实体的load值来起作用的。
+
+3.memory子系统的实现
+memory子系统可以设定cgroup中任务使用的内存限制，并且自动生成由那些任务使用的内存资源报告。memory子系统是通过linux的resource counter机制实现的。
+1.resource counter机制
+Resource counter是内核为子系统提供的一种资源管理机制，这个机制的实现包括了用于记录资源的数据结构和相关函数。Resource counter定义了一个res_counter的结构体来管理特定资源
+struct res_counter {
+  unsigned long long usage;//当前已经使用的资源
+  unsigned long long max_usage;//使用过的最大资源量
+  unsigned long long limit;//设置资源的使用上限，进程组不能使用超过这个限制的资源
+  unsigned long long soft_limit;//设定一个软上限，进程组使用的资源可以超过这个限制
+  unsigned long long failcnt;//记录资源分配失败的次数，管理根据这个记录，调整上限值
+  spinlock_t lock;
+  struct res_counter *parent;//指向父节点，用于处理层次性的资源管理
+};
+
+初始化一个res_counter。
+void res_counter_init(struct res_counter *conuter, struct res_counter *parent)
+{ 
+   spin_lock_init(&counter->lock);
+   counter->limit = RESOURCE_MAX;
+   counter->soft_limit = RESOURCE_MAX;
+   counter->parent = parent;
+}
+
+当资源要被分配的时候，资源就要被记录到相应的res_counter里面。这个函数的作用是记录进程组使用的资源
+int res_counter_charge(struct res_counter *counter,unsigned long val,struct res_counter **limit_fail_at)
+{
+   for(c = counter; c!= NULL; c = c->parent) {
+     spin_lock(&c->lock);
+     ret = res_counter_charge_locked(c,val);
+     spin_unlock(&c->lock);
+     if(ret < 0) {
+       *limit_fail_at = c;
+       goto undo;
+     }
+   }
+}
+
+在这个循环中，从当前的res_counter开始，从下往上逐层增加资源的使用量。
+res_counter_charge_locked函数是在加锁的情况下增加使用量。首先判断是否已经超过使用上限，如果是的话就增加失败次数，返回相关代码，否则就增加使用量的值，如果这个值已经超过历史最大值，则更新最大值。
+res_counter_charge_locked () 
+{
+   if (counter->usage + val > counter->limit) {
+      counter->failcnt++;
+      return -ENOMEM;
+   }
+   counter->usage += val;
+   if(counter->usage > counter->max_usage)
+     conuter->max_usage = conuter->usage;
+   return 0;
+}
+
+当资源被归还到系统的时候，在相应的res_counter减轻相应的使用量。从当前counter开始，从下往上逐层减少使用量，其中调用res_counter_uncharge_locked函数的作用是在加锁的情况下减少相应的counter的使用量。
+void res_counter_uncharge(struct res_counter *counter,unsigned long val)
+{
+  for(c = counter;c!=NULL;c = c->parent) {
+    spin_lock(&c->lock);
+    res_counter_uncharge_locked(c,val);
+    spin_unlock(&c->lock);
+}
+
+有这些数据结构和函数，只需要在内核分配资源的时候，植入相应的charge函数，释放资源时，植入相应的uncharge函数，就能实现对资源的控制。
+2.memory子系统如何利用resource counter 实现对内存资源的管理
+1.mem_cgroup结构
+struct mem_cgroup {
+  struct cgroup_subsys_state css;
+  struct res_counter res;//管理memory资源
+  struct res_counter memsw;//管理memory+swap资源
+  struct mem_cgroup_lru_info info;
+  spinlick_t reclaim_param_lock;
+  int prev_priority;
+  int last_scanned_child;
+  bool use_hierarchy;//标记资源控制和记录时是否时层次性的
+  atomic_t oom_lock;
+  atomic_t refcnt;
+  unsigned int swappiness;
+  int oom_kill_disable;是否使用oom-killer
+  bool memsw_is_minimum;
+  struct mutex thresholds_lock;
+  struct mem_cgroup_thresholds thresholds;
+  struct mem_cgroup_thresholds mems_threasholds;
+  struct list_head oom_notify;//指向一个oom notifier event fd链表
+  unsigned long move_charge_at_immigrate;
+  struct mem_cgroup_stat_cpu *stat;
+} 
+
+根其他子系统一样，mem_cgroup包含一个cgroup_subsys_state成员，便于task或者cgroup获取mem_cgroup。当memsw_is_minimum为true，则res.limit=memsw.limit,当进程组使用的内存超过memory的限制时，不能通过swap缓解。
+struct page_cgroup {
+  unsigned long flags;
+  struct mem_cgroup *mem_cgroup;
+  struct page *page;
+  struct list_head lru;
+};
+
+看作是mem_map的扩展。每个page_cgroup都和所有的page关联，而其中的mem_cgroup成员，则将page与特定的mem_cgroup关联起来。
+在linux系统中，page结构体是用来管理物理页框的，一个物理页框对应一个page结构体，而每个进程中的task_struct都有一个mm_struct来管理进程的内存信息。每个mm_struct知道它属于的进程，从而知道所属的mem_cgroup，而内存使用量的计算是按cgroup为单位的，这样以来，内存资源的管理就可以实现了。
+2.charge和uncharge操作
+memory子系统是通过resource counter实现的，肯定会在内存分配给进程时进程charge操作，来看一下charge操作
+1. Page fault发生时，两种情况下内核需要给进程分配新的页框，一种是进程请求调页，(demand paging),另一种是copy on write
+
+
+跟其它子系统一样，memory子系统也实现了一个cgroup_subsys
+struct cgroup_subsys mem_cgroup_subsys = {
+  .name = "memory",
+  .subsys_id = mem_cgroup_subsys_id,
+  .create = mem_cgroup_create,
+  .pre_destroy = mem_cgroup_pre_destory,
+  .destory = mem_cgroup_destory,
+  .populate = mem_cgroup_populate,
+  .can_attach = mem_cgroup_can_attach,
+  .cancel_attach = mem_cgroup_cancel_attach,
+  .attach = mem_cgroup_move_task,
+  .early_init = 0;
+  .use_id = 1,
+};
+
+memory子系统中重要的文件有,这个文件用于设定memory+swap上限值
+memsw.limit_in_bytes
+ {
+   .name = "memsw.limit_in_bytes",
+   .private = MEMFILE_PRIVATE(_MEMSWAP,RES_LIMIT),
+   .write_string = mem_cgroup_write,
+   .read_u64 = mem_cgroup_read,
+ },
+
+这个文件用于设定memory上限值
+Limit_in_bytes
+  {
+     .name = "limit_in_bytes",
+     .private = MEMFILE_PRIVATE(_MEM,RES_LIMIT),
+     .write_string = mem_cgroup_write,
+     .read_u64 = mem_cgroup_read,
+  },
+
+4.blkio子系统
+块I/O(blkio）子系统控制并监控cgroup中的任务对块设备的I/O访问，在部分控制文件中写入值可以限制访问或带宽，且从这些控制文件中读取可提供I/O操作信息。对文件blkio.weight写入相应值可以指定cgroup默认可用访问块I/O的相对比例，范围在100到1000，跟cpu子系统里面的cpu.shares文件类似，一个是控制进程占有的IO时间，一个是控制进程占有的cpu时间。
+{
+ .name = "weight",
+ .read_u64=blikiocg_weight_read,//对blkio.weight字段读操作
+ .write_u64=blkiocg_weight_write,//对blkio.weight字段写操作
+}
+
+blkio子系统定义一个blkio_cgroup结构存储一个cgroup的block IO信息。
+struct blkio_cgroup {
+  struct cgroup_subsys_state css;
+  unsigned int weight;//存储blkio.weight的值，控制此cgroup中的进程占有的IO时间
+  spinlock_t lock;
+  struct hlist_head blkg_list;
+  struct list_head policy_list;
+};
+
+跟其它子系统一样，内嵌了一个cgroup_subsys_state 成员。
+
+blkio是通过CFQ IO调度器实现的，IO调度器的作用是处理进程的IO请求，然后将其交给相应的块设备处理。IO调度器一般采用电梯算法，CFQ是其中一种。CFQ的核心思想是，每个进程有自己的IO请求队列，各个进程的队列之间按时间片轮转来处理，保证每个进程都能公平获得IO宽带。CFQ是linux内核默认的IO调度算法，Blkio子系统是通过CFQ组调度实现的，跟cpu子系统通过CFS组调度实现的相似。
+5.freezer子系统
+freezer子系统用于挂起和恢复cgroup中的进程。freezer有一个控制文件：freezer.state,将FROZEN写入该文件，可以将cgroup中的进程挂起，将THAWED写入该文件，可以将已挂起的进程恢复。该文件可能读出的值有三种，其中两种就是FROZEN和THAWED，分别代表进程已挂起和已恢复，还有一种是FREEZING显示该值表示该cgroup中有些进程现在不能被frozen，当这些不能被frozen的进程从该cgroup中消失的时候，FREEZING会变成FROZEN，或者手动将FROZEN或THAWED写入一次。
+struct freezer {
+  struct cgroup_subsysy_state css;
+  enum freezer_state state;
+  spinlock_t lock;
+};
+
+内嵌一个cgroup_subsys_state便于从cgroup或task获得freezer结构，另一个字段存储cgroup当前的状态。
+freezer子系统是通过对freezer.state文件进行写入来控制进程的，从这个文件的cftype定义出发
+static struct cftype files[] = {
+ {
+  .name = "state",
+  .read_seq_string = freezer_read,
+  .write_string = freezer_write,
+ },
+ };
+
+从文件读取是freezer_read实现的，该函数比较简单，主要是从freezer结构体中读出状态，但是对FREEZING状态做了特殊处理：
+state = freezer->state;
+if (state == CGROUP_FREEZING) {
+    update_freezer_state(cgroup,freezer);
+    state = freezer->state;
+    }
+
+如果是FREEZING状态，就需要更新状态（因为之前不能frozen的进程可能已经不在了）。
+update_freezer_state (...) 
+{
+   ....
+   cgroup_iter_start(cgroup,&it);
+   while((task = cgroup_iter_next(cgroup,&it))) {
+      nototal++;
+      if(is_task_frozen_enough(task))
+        nfrozen++；
+   }
+   if(nfrozen == ntotal)
+     freezer->state = CGROUP_FROZEN;
+   else if (nfrozen > 0)
+     freezer->state = CGROUP_FREEZING;
+   else
+     freezer->state = CGROUP_THAWED;
+     cgroup_iter_end(cgroup,&it);   
+
+对该cgroup所有的进程都迭代一遍，分别统计进程数和已经frozen的进程数，然后根据统计结果改变状态。
+对freezer.state写入的情况，freezer_write来处理，该函数从写入值获取目标状态，然后调用freezer_change_state（cgroup,goal_state)来完成操作。在freezer_change_state中，根据goal_state分别调用不同的实现函数：
+switch(goal_state) {
+case CGROUP_THAWED:
+   unfreeze_cgroup（cgroup,freezer);
+   break;
+case CGROUP_FROZEN:
+   retval = try_to_freeze_cgroup(cgroup,freezer);
+   break;
+default:
+   BUG();
+   }
+
+frozen的时候，由try_to_freeze_cgroup处理
+freezer->state = CGROUP_FREEZING;
+cgroup_iter_start(cgroup,&it);
+while((task = cgroup_iter_next(cgroup,&it))) {
+   if(!freeze_task(task,true))
+      continue;
+   if(is_task_frozen_enough(task))
+      continue;
+   if(!freezing(task) && !freezer_should_skip(task))
+      num_cant_freeze_now++;
+}
+cgroup_iter_end(cgroup,&it);
+return num_cant_freeze_now ? -EBUSY:0;
+
+首先将当前状态设成CGROUP_FREEZING,然后对cgroup中的进程进行迭代，while循环中对进程进程freeze操作，如果成功直接进行下一次迭代，如果不成功进行进一步判断，如果进程已经frozen了，也直接进行下一次迭代，如果不是，则进行计数，根据计数结果进行返回，所有的进程都顺利frozen，返回0，否则返回-EBUSY表示有进程不能被frozen.
+freeze_task这个函数对task进行freeze操作
+if(!freezing(p)) {
+  rmb();
+  if(frozen(p))
+    return false;
+  
+  if(!sig_only || shoule_send_signal(p))
+     set_freeze_flag(p);
+  else
+     return false;
+ }
+ 
+ if (should_send_signal(p)) {
+    if(!signal_pending(p))
+      fake_signal_wake_up(p);
+ }else if (sig_only) {
+     return false;
+ }else {
+     wake_up_state(p,TASK_INTERRUPTIBLE);
+  }
+   return true;
+
+ 首先检查进程是否已经被标记为正在freezing,如果不是在做判断，如果进程已经被frozen,返回false.如果进程不是sig_only或者可以发送信号（进程无PF_FRRRZER_NOSIG标记）则设置进程的TIF_FREEZE。
+根据进程是否有PF_FREEZER_NOSIG标记进行进一步处理，如果没有这个标记，给进程发送一个信号，唤醒进程，让进程处理TIF_FREEZE,即进行freeze操作，如果有这个标记，则如果进程是sig_only的，返回false(不能完成free操作），否则直接唤醒进程取处理TIF_FREEZE.
+对freezer子系统调用来说，sig_only=true，能成功执行set_freeze-flag(p)->fake-signal_wake_up(p);
+
+thaw进程的情况下，又unfreeze_cgroup处理。
+cgroup_iter_start(cgroup,&it);
+while((task = cgroup_iter_next(cgroup,&it))) {
+  thaw_process(task);
+}
+cgroup_iter_end(cgroup,&it);
+freezer->state = CGROUP_THAWED;
+
+ 对该cgroup中所有进程调用thaw_process，
+if (__thaw_process(p) == 1) {
+   task_unlock(p);
+   wake_up_process(p);
+   return 1;
+   }
+   thaw_process清掉了相关标记后。，只需要唤醒进程，然后内核会自动处理
+   
+   
+   其中，__thaw_process中
+   if(frozen(p)) {
+     p->flags &= ~PF_FROZEN;
+     return 1;
+     }
+   clear_freeze_flag(p);
+   如果进程已经frozen, 清除掉frozen标记，如果不是说明进程已经设置TIF_FREEZE,但是还没有
+   frozen,只需要清掉TIF_FREEZE即可。
+
+ freezer子系统结构体的定义
+struct cgroup_subsys freezer_subsys = {
+    .name = "freezer",
+    .create = freezer_create,
+    .destory = freezer_destroy,
+    .populate = freezer_popilate,
+    .subsys_id = freezer_subsys_id,
+    .can_attach = freezer_can_attach,
+    .attach = NULL,
+    .fork = freezer_fork,
+    .exit = NULL,
+};  
+
+can_attach是在一个进程加入到一个cgroup之前调用的，检查是否可以attach,freezer_can_attach中对cgroup当前的状态做检查，如果是frozen就返回错误，说明不能将一个进程加入到一个frozen的cgroup。
+
+6.devices子系统
+使用devices子系统可以允许或者拒绝cgroup中的进程访问设备，devices子系统有三个控制文件：devices.allow，devices.deny,devices.list。devices.allow用于指定cgroup中的进程可以访问的设备，devices.deny用于指定cgroup中的进程不能访问的设备，devices.list用于报告cgroup中的进程访问的设备。devices.allow文件中包含若干条目，每个条目有四个字段：type，major,minor,和access.
+type,major,minor字段中使用的值对应Linux分配的设备，
+type指定设备类型：
+a - 应用所有设备，可以是字符设备，或者块设备
+b - 指定块设备
+c - 指定字符设备
+major 和minor指定设备的主次设备号
+access指定相应的权限：
+r - 允许任务从指定的设备中读取
+w- 允许任务写入指定设备
+m - 允许任务生成还不存在的设备文件
+devices子系统通过提供device whitelist实现的，与其它子系统一样，devices子系统有一个内嵌cgroup_subsystem_state的结构来管理资源。
+struct dev_cgroup {
+   struct cgroup_subsys_state css;
+   struct list_head whitelist;//指向该cgroup的进程可以访问的devices whitelist
+   };
+
+devices子系统如何管理whitelist，在devices子系统中，定义一个叫dev_whitelist_item的结构来管理可以访问的device,对应于devices.allow中的一个条目
+struct dev_whitelist_item {
+   u32 major,minor;//指定设备的主次设备号
+   short type;//设备的类型
+   short access;
+   struct list_head list;//将该结构体连接到相应的dev_cgroup中的whitelist指向的链表
+   struct rcu_head rcu;
+   };
+
+type的取值可以是如下，对应于devices.allow文件中的三种情况
+#define DEV_BLOCK 1
+#define DEV_CHAR 2
+#define DEV_ALL 4
+
+access用于相应的访问权限，access的取值可以是：和之前devices.allow文件中的情况对应
+#define ACC_MKNOD 1
+#define ACC_READ 2
+#define ACC_WRITE 4
+
+通过以上数据结构，devices子系统能管理一个cgroup的进程可以访问的devices,
+devices子系统通过实现两个函数供内核调用来实现控制cgroup中的进程能访问的devices,
+int devcgroup_inode_permission(struct inode *inode,int mask)
+{
+  struct dev_cgroup *dev_cgroup;
+  struct dec_whitelist_item *wh;
+  
+  dev_t device = inode->i_rdev;
+  if(!device)
+    return 0;
+  if(!S_ISBLK(inode->i_mode) && !S_ISCHAR(inode->i_mode))
+    return 0;
+    
+   rcu_read_lock();
+   
+   dev_cgroup = task_devcgroup(current);
+   
+   list_for_each_entry_rcu(wh,&dev_cgroup->whitelist,list) {
+     if(wh->type & DEV_ALL)
+       goto found;
+     if((wh->type & DEV_BLOCK) && !S_ISBLK(inode->i_mode))
+        continue;
+     if((wh->type & DEV_CHAR） && ！S_ISCHR（inode->i_mode))
+        continue;
+     if(wh->major != ~0 && wh->major != imajor(inode))
+        continue;
+     if(wh->minor != ~0 && wh->minor != iminor(inode))
+        continue;
+        
+     if((mask & MAY_WRITE) && !(wh->access & ACC_WRITE))
+        continue;
+     if((mask & MAY_READ) && !(wh->access & ACC_READ))
+        continue;
+        
+  found:
+      rcu_read_unlock();
+      return 0;
+    }
+    rcu_read_unlock();
+    
+    return -EPERM;
+ }  
+
+首先如果该inode对应的不是devices,直接返回0，如果既不是块设备也不是字符设备，也返回0，devices只是控制块设备和字符设备的访问，其他情况不管。接着获取当前进程的dev_cgroup，然后在dev_cgroup中whitelist指针的链表中查找，如果找到对应设备而且mask指定的权限和设备的权限一致就返回0，如果没有找到就返回错误。
+这个函数是针对inode存在的情况下，通过对比权限来控制cgroup中的进程能够访问的devices,还有一种情况是inode不存在，在这种情况下，一个进程访问一个设备就必须通过mknod建立相应的设备文件。为了达到这种情况的控制，devices子系统导出第二个函数
+int devcgroup_inode_mknod(int mode,dev_t dev)
+{
+    struct dev_cgroup *dev_cgroup;
+    struct dev_whitelist_item *wh;
+    
+    if(!S_ISBLK(mode) && !S_ISCHR(mode))
+       return 0;
+       
+    rcu_read_lock();
+    ....
+
+这个函数的实现与第一个函数类似。
+devices子系统本身的实现
+struct cgroup_subsys devices_subsys = {
+   .name = "devices"
+   .can_attach = devgroup_can_attach,
+   .create = devcgroup_create,
+   .destory = devcgroup_destroy,
+   .populate = devcgroup_populate,
+   .subsys_id = devices_subsys_id,
+  };
+
+devices相应的三个控制文件
+static struct cftype dev_cgroup_files[] = {
+   {
+     .name = "allow",
+     .write_string = devcgroup_access_write,
+     .private = DEVCG_ALLOW,
+    },
+    
+    {
+      .name = "deny",
+      .write_string = devcgroup_access_write,
+      .private = DEVCG_DENY,
+    },
+    
+    {
+       .name = "list",
+       .read_seq_string = devcgroup_seq_read,
+       .private = DEVCG_LIST,
+     },
+  };
+
+其中，allow和deny都是通过devcgroup_access_write实现的，只是通过private字段区分，因为二者的实现逻辑有相同的地方。devcgroup_access_write最终通过调用devcgroup_undate_access来实现。在devcgroup_undate_access中根据写入的内容构造一个dev_whitelist_item，然后根据文件类型做不同的处理
+switch (filetype) {
+case DEVCG_ALLOW:
+  if(!parent_has_perm(devcgroup,&wh))
+     return -EPERM;
+  return dev_whitelist_add(devcgroup,&wh);
+case DEVCG_DENY:
+  dev_whitelist_rm(devcgroup,&wh);
+  break;
+defalut:
+  return -EINVAL;
+}
+
+allow的话，就将item加入whitelist，deny的话，就将item从whitelist中删去。
+7.ns子系统
+ns子系统没有自己的控制文件，ns子系统没有属于自己的状态信息，从ns_cgroup的定义可以看出
+struct ns_cgroup {
+   struct cgroup_subsys_state css;
+};
+
+ns子系统的实现也比较简单，提供一个ns_cgroup_clone函数，在copy_process和unshare_nsproxy_namespaces被调用，而ns_cgroup_clone函数本身的实现简单，在当前的cgroup下创建一个子cgroup,该子cgroup完全clone当前cgroup的信息，将当前的进程移到新建立的cgroup中。
+分析一下ns_cgroup_clone被调用的时机，看copy_process中的代码
+if(current->nsproxy != p->nsproxy) {
+   retval = ns_cgroup_clone(p,pid);
+   if(retval)
+     goto bad_fork_free_pid;
+ }
+
+copy_process是在do_fork中被调用的，作用在于为子进程复制父进程的相关信息，当前进程（父进程）和子进程的命名空间不同时，调用ns_cgroup_clone,ns子系统提供一种同命名空间的进程聚类机制，具有相同命名空间的进程会在相同的cgroup中。
+什么时候，父进程fork出的子进程会拥有不同的命名空间，在调用fork时候，加入了特殊flag(NEWPID,NEWNS)时，内核会为子进程创建不同的命名空间。
+
+除了这种情况，ns_cgroup_clone在unshare_nsproxy_namespaces用到，unshare_nsproxy_namespace函数被sys_unshare中调用，实际上对unshare系统调用的实现，当指定相应标记时，unshare系统调用会为调用的进程创建不同的命名空间，调用ns_cgroup_clone为其创建新的cgroup。
